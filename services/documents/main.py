@@ -7,7 +7,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from celery import Celery
-from fastapi import Body, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, Response
 from opentelemetry import baggage, context, trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -20,9 +20,12 @@ from pydantic import BaseModel, Field
 from pymongo import MongoClient
 import psycopg
 
+from common.auth import require_roles
+from common.logging import configure_structured_logging
 from .storage_s3 import DEFAULT_TENANT, presign_get, presign_put
 
 
+configure_structured_logging("documents")
 logger = logging.getLogger("documents")
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://mongo:27017")
@@ -330,7 +333,9 @@ def process_document_task(doc_id: str, tenant_id: Optional[str] = None) -> Dict[
     return _run_ocr_pipeline(doc_id, tenant_id)
 
 
-@app.post("/storage/presign-upload")
+@app.post(
+    "/storage/presign-upload", dependencies=[Depends(require_roles(["editor", "admin"]))]
+)
 def presign_upload(req: PresignUploadReq):
     tenant = _resolve_tenant(req.tenant_id)
     data = presign_put(req.key, req.content_type, tenant)
@@ -350,7 +355,7 @@ def get_doc(doc_id: str):
     return _serialize_document(doc)
 
 
-@app.patch("/documents/{doc_id}")
+@app.patch("/documents/{doc_id}", dependencies=[Depends(require_roles(["editor", "admin"]))])
 def patch_doc(
     doc_id: str,
     changes: List[PatchChange] = Body(...),
@@ -371,7 +376,7 @@ def patch_doc(
     return {"doc_id": doc_id, "updated": len(changes)}
 
 
-@app.post("/documents/bulk")
+@app.post("/documents/bulk", dependencies=[Depends(require_roles(["editor", "admin"]))])
 def bulk_patch(req: BulkPatchRequest):
     results = []
     ok = 0

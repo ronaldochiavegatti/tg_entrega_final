@@ -5,7 +5,7 @@ import time
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import psycopg
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
 from opentelemetry import baggage, context, trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -19,6 +19,10 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 from pymongo import MongoClient
 
+from common.auth import require_roles
+from common.logging import configure_structured_logging
+
+configure_structured_logging("orchestrator")
 logger = logging.getLogger("orchestrator")
 
 
@@ -252,7 +256,7 @@ class IngestReq(BaseModel):
     tenant_id: Optional[str] = None
 
 
-@app.post("/ingest")
+@app.post("/ingest", dependencies=[Depends(require_roles(["editor", "admin"]))])
 def ingest(req: IngestReq):
     doc = documents_collection.find_one({"_id": req.doc_id})
     if not doc:

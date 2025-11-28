@@ -6,7 +6,7 @@ from collections import defaultdict
 from typing import Dict, Iterable, List, Optional
 
 from celery import Celery
-from fastapi import Body, FastAPI, HTTPException, Request, Response, status
+from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from opentelemetry import baggage, context, trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -20,7 +20,10 @@ from pydantic import BaseModel, Field
 from pymongo import MongoClient
 
 from .db import get_conn
+from common.auth import require_roles
+from common.logging import configure_structured_logging
 
+configure_structured_logging("limits")
 logger = logging.getLogger("limits")
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://mongo:27017")
@@ -367,7 +370,9 @@ def dashboard(year: int, tenant_id: str):
     )
 
 
-@app.get("/limits/{year}/export")
+@app.get(
+    "/limits/{year}/export", dependencies=[Depends(require_roles(["editor", "admin"]))]
+)
 def export(year: int, tenant_id: str, format: str = "csv"):
     dashboard_data = dashboard(year, tenant_id)
     if format != "csv":
@@ -381,7 +386,11 @@ def export(year: int, tenant_id: str, format: str = "csv"):
     return StreamingResponse(_csv_stream(), media_type="text/csv")
 
 
-@app.post("/limits/recalculate", status_code=status.HTTP_202_ACCEPTED)
+@app.post(
+    "/limits/recalculate",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_roles(["editor", "admin"]))],
+)
 def recalc(body: RecalcReq = Body(...)):
     dashboard = recalc_limits(body.tenant_id, body.year, body.doc_ids)
     return {"accepted": True, "state": dashboard.state}
