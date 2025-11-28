@@ -143,7 +143,7 @@ def document_detail() -> rx.Component:
     return rx.box(
         rx.heading("Detalhe", size="md"),
         rx.cond(
-            AppState.selected_document == None,
+            AppState.selected_document is None,
             rx.text("Selecione um documento para ver detalhes."),
             rx.vstack(
                 rx.text(lambda: AppState.selected_document.title, font_weight="bold"),
