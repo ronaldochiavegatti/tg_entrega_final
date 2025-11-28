@@ -20,7 +20,9 @@ from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 
 from .db import get_conn
+from common.logging import configure_structured_logging
 
+configure_structured_logging("billing")
 logger = logging.getLogger("billing")
 
 

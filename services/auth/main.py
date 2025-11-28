@@ -19,6 +19,8 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 
+from common.logging import configure_structured_logging
+
 
 class Settings(BaseSettings):
     jwt_alg: str = "RS256"
@@ -30,6 +32,7 @@ class Settings(BaseSettings):
     default_tenant: str = "demo"
 
 
+configure_structured_logging("auth")
 settings = Settings()
 
 
@@ -205,6 +208,7 @@ def validate(user=Depends(get_current_user)):
     headers = {
         "X-User-Id": user.get("sub", ""),
         "X-Tenant-Id": user.get("tenant_id", ""),
+        "X-User-Role": user.get("role", ""),
     }
     return JSONResponse({"user": user}, headers=headers)
 
