@@ -1,0 +1,186 @@
+name: CI/CD
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  PYTHON_VERSION: "3.11"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install lint dependencies
+        run: python -m pip install --upgrade pip ruff
+
+      - name: Ruff
+        run: ruff check .
+
+  unit-tests:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-test.txt \
+            -r services/auth/requirements.txt \
+            -r services/billing/requirements.txt \
+            -r services/documents/requirements.txt \
+            -r services/limits/requirements.txt \
+            -r services/orchestrator/requirements.txt
+
+      - name: Run unit tests
+        run: pytest tests
+
+  integration:
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compose up for integration
+        run: docker compose -f docker-compose.yml up -d --build
+
+      - name: Show compose status
+        run: docker compose -f docker-compose.yml ps
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.yml down -v
+
+  build-and-scan:
+    needs: integration
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [auth, documents, limits, orchestrator, billing]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image for ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/Dockerfile.fastapi
+          build-args: |
+            SERVICE_PATH=services/${{ matrix.service }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}:ci
+          load: true
+
+      - name: Scan with Trivy
+        uses: aquasecurity/trivy-action@v0.24.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}:ci
+          format: table
+          exit-code: 1
+          ignore-unfixed: true
+
+      - name: Scan with Grype
+        uses: anchore/grype-action@v1
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}:ci
+
+  publish-images:
+    needs: build-and-scan
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service: [auth, documents, limits, orchestrator, billing]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push release image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/Dockerfile.fastapi
+          build-args: |
+            SERVICE_PATH=services/${{ matrix.service }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}:${{ github.ref_name }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}:latest
+
+  deploy-staging:
+    needs: publish-images
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      ORACLE_S3_ACCESS_KEY_ID: ${{ secrets.ORACLE_S3_ACCESS_KEY_ID }}
+      ORACLE_S3_SECRET_ACCESS_KEY: ${{ secrets.ORACLE_S3_SECRET_ACCESS_KEY }}
+      JWT_PRIVATE_KEY: ${{ secrets.JWT_PRIVATE_KEY }}
+      JWT_PUBLIC_KEY: ${{ secrets.JWT_PUBLIC_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare deployment secrets
+        run: |
+          mkdir -p deploy-secrets
+          echo "$JWT_PRIVATE_KEY" > deploy-secrets/jwt_private.pem
+          echo "$JWT_PUBLIC_KEY" > deploy-secrets/jwt_public.pem
+          echo "ORACLE_S3_ACCESS_KEY_ID=$ORACLE_S3_ACCESS_KEY_ID" > deploy-secrets/.env.staging
+          echo "ORACLE_S3_SECRET_ACCESS_KEY=$ORACLE_S3_SECRET_ACCESS_KEY" >> deploy-secrets/.env.staging
+
+      - name: Deploy to staging
+        run: |
+          echo "Publishing images for ${{ github.ref_name }} to staging with stored secrets"
+          # Add helm/compose deploy command here, wired to staging cluster
+
+  deploy-production:
+    needs: deploy-staging
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Await manual approval and deploy to production
+        run: |
+          echo "Deploying ${{ github.ref_name }} to production after manual approval"
+          # Add production deployment steps here

@@ -35,3 +35,11 @@ Healthchecks úteis:
 - Gateway: http://localhost:8080
 
 Para encerrar o ambiente: `make down`.
+
+## CI/CD
+- CI executa `ruff`, testes unitários com `pytest`, sobe o stack com `docker compose` para checagem de integração e então constrói as imagens Docker dos serviços FastAPI. Cada imagem é analisada por Trivy e Grype antes de seguir adiante.
+- Tags no formato `v*` disparam a publicação das imagens no GHCR e um deploy automático para o ambiente de staging. Há um estágio separado que exige aprovação manual para promover a mesma tag para produção.
+
+### Segredos no pipeline
+- Armazene chaves sensíveis no provedor de segredos do CI (ex.: GitHub Secrets) e não no repositório. O pipeline espera encontrar `ORACLE_S3_ACCESS_KEY_ID`, `ORACLE_S3_SECRET_ACCESS_KEY`, `JWT_PRIVATE_KEY` e `JWT_PUBLIC_KEY` como segredos.
+- Os secrets são materializados em arquivos e variáveis somente durante os jobs de deploy (staging/produção), evitando que chaves Oracle ou JWT sejam versionadas ou exibidas em logs.
