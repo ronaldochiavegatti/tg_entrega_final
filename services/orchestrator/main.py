@@ -58,10 +58,16 @@ def _ensure_tables() -> None:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS billing_tariffs (
+                kind TEXT PRIMARY KEY,
+                unit_price NUMERIC(12,6) NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS billing_usage (
                 id BIGSERIAL PRIMARY KEY,
                 tenant_id TEXT NOT NULL,
                 ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                kind TEXT NOT NULL,
                 tokens_prompt INT NOT NULL,
                 tokens_completion INT NOT NULL,
                 cost NUMERIC(12,6) NOT NULL,
@@ -69,9 +75,27 @@ def _ensure_tables() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_billing_usage_tenant_ts
                 ON billing_usage (tenant_id, ts DESC);
+            CREATE INDEX IF NOT EXISTS idx_billing_usage_kind_ts
+                ON billing_usage (kind, ts DESC);
+
+            CREATE TABLE IF NOT EXISTS billing_budgets (
+                tenant_id TEXT PRIMARY KEY,
+                budget NUMERIC(12,2) NOT NULL,
+                alert_threshold NUMERIC(5,2) NOT NULL DEFAULT 0.8,
+                alert_sent BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_alert_at TIMESTAMPTZ
+            );
             """
         )
-
+        cur.execute(
+            """
+            INSERT INTO billing_tariffs (kind, unit_price)
+            VALUES ('rag', %s), ('ocr', %s), ('extract', %s)
+            ON CONFLICT (kind) DO NOTHING
+            """,
+            [0.000001, 0.000001, 0.000001],
+        )
 
 @app.on_event("startup")
 def on_startup() -> None:
@@ -117,20 +141,33 @@ def _chunk_text(text: str) -> List[str]:
     return chunks
 
 
+def _get_unit_price(kind: str) -> float:
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT unit_price FROM billing_tariffs WHERE kind = %s", [kind])
+        row = cur.fetchone()
+    return float(row[0]) if row else 0.000001
+
+
 def _record_usage(
-    tenant_id: str, tokens_prompt: int, tokens_completion: int, meta: Optional[Dict]
+    tenant_id: str, tokens_prompt: int, tokens_completion: int, meta: Optional[Dict], kind: str = "rag"
 ) -> Dict[str, float]:
-    cost = round((tokens_prompt + tokens_completion) * 0.000001, 6)
+    unit_price = _get_unit_price(kind)
+    cost = round((tokens_prompt + tokens_completion) * unit_price, 6)
     with pg_conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO billing_usage (tenant_id, tokens_prompt, tokens_completion, cost, meta)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO billing_usage (tenant_id, kind, tokens_prompt, tokens_completion, cost, meta)
+            VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
-            [tenant_id, tokens_prompt, tokens_completion, cost, json.dumps(meta or {})],
+            [tenant_id, kind, tokens_prompt, tokens_completion, cost, json.dumps(meta or {})],
         )
-    return {"tokens_prompt": tokens_prompt, "tokens_completion": tokens_completion, "cost": cost}
+    return {
+        "tokens_prompt": tokens_prompt,
+        "tokens_completion": tokens_completion,
+        "unit_price": unit_price,
+        "cost": cost,
+    }
 
 
 class IngestReq(BaseModel):
@@ -287,6 +324,7 @@ def chat(req: ChatReq):
         tokens_prompt=prompt_tokens,
         tokens_completion=completion_tokens,
         meta={"tool_calls": tool_calls, "contexts": jsonable_encoder(contexts)},
+        kind="rag",
     )
 
     return {
