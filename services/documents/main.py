@@ -1,25 +1,34 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional, List
-from .storage_s3 import presign_put, presign_get
+
+from .storage_s3 import DEFAULT_TENANT, presign_get, presign_put
 
 app = FastAPI(title="documents")
+
+
+def _resolve_tenant(tenant_id: Optional[str]) -> str:
+    return tenant_id or DEFAULT_TENANT
 
 
 class PresignUploadReq(BaseModel):
     key: str
     content_type: Optional[str] = "application/pdf"
+    tenant_id: Optional[str] = None
 
 
 @app.post("/storage/presign-upload")
 def presign_upload(req: PresignUploadReq):
-    data = presign_put(req.key, req.content_type)
-    return {"url": data["url"], "fields": data["fields"], "expires_in": 900}
+    tenant = _resolve_tenant(req.tenant_id)
+    data = presign_put(req.key, req.content_type, tenant)
+    return {"url": data["url"], "expires_in": data["expires_in"], "key": data["key"]}
 
 
 @app.get("/storage/presign-download")
-def presign_download(key: str):
-    return {"url": presign_get(key), "expires_in": 900}
+def presign_download(key: str, tenant_id: Optional[str] = None):
+    tenant = _resolve_tenant(tenant_id)
+    data = presign_get(key, tenant)
+    return {"url": data["url"], "expires_in": data["expires_in"], "key": data["key"]}
 
 
 # --- CRUD mínimo (mock) ---
