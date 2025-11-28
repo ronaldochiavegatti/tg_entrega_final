@@ -1,19 +1,300 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
+import hashlib
+import json
+import logging
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import psycopg
+from fastapi import FastAPI, HTTPException
+from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings
+from pymongo import MongoClient
+
+logger = logging.getLogger("orchestrator")
+
+
+class Settings(BaseSettings):
+    postgres_dsn: str = Field(
+        default="postgresql://postgres:postgres@postgres:5432/app",
+        alias="POSTGRES_DSN",
+    )
+    mongo_uri: str = Field(default="mongodb://mongo:27017", alias="MONGO_URI")
+    mongo_db: str = Field(default="app", alias="MONGO_DB")
+    default_tenant: str = Field(default="demo", alias="DEFAULT_TENANT_ID")
+    embedding_dim: int = Field(default=64, alias="EMBEDDING_DIM")
+    chunk_size: int = Field(default=800, alias="CHUNK_SIZE")
+    chunk_overlap: int = Field(default=120, alias="CHUNK_OVERLAP")
+
+
+settings = Settings()
+pg_conn = psycopg.connect(settings.postgres_dsn, autocommit=True)
+mongo_client = MongoClient(settings.mongo_uri)
+mongo_db = mongo_client[settings.mongo_db]
+documents_collection = mongo_db["documents"]
 
 app = FastAPI(title="orchestrator")
 
 
+def _ensure_tables() -> None:
+    with pg_conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS embeddings (
+                id BIGSERIAL PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                doc_id TEXT NOT NULL,
+                chunk_no INT NOT NULL,
+                text TEXT NOT NULL,
+                embedding VECTOR(%s) NOT NULL,
+                meta JSONB DEFAULT '{}'::jsonb
+            );
+            CREATE INDEX IF NOT EXISTS idx_embeddings_tenant_doc_chunk
+                ON embeddings(tenant_id, doc_id, chunk_no);
+            CREATE INDEX IF NOT EXISTS idx_embeddings_vector
+                ON embeddings USING hnsw (embedding vector_l2_ops);
+            """,
+            [settings.embedding_dim],
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS billing_usage (
+                id BIGSERIAL PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                tokens_prompt INT NOT NULL,
+                tokens_completion INT NOT NULL,
+                cost NUMERIC(12,6) NOT NULL,
+                meta JSONB DEFAULT '{}'::jsonb
+            );
+            CREATE INDEX IF NOT EXISTS idx_billing_usage_tenant_ts
+                ON billing_usage (tenant_id, ts DESC);
+            """
+        )
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    _ensure_tables()
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    mongo_client.close()
+    pg_conn.close()
+
+
+def _tokenize(text: str) -> List[str]:
+    return [tok.lower() for tok in text.split() if tok.strip()]
+
+
+def _fake_embedding(text: str) -> List[float]:
+    digest = hashlib.sha256(text.encode()).digest()
+    numbers = [b for b in digest]
+    vec: List[float] = []
+    for i in range(settings.embedding_dim):
+        vec.append(numbers[i % len(numbers)] / 255.0)
+    return vec
+
+
+def _vector_literal(vec: Iterable[float]) -> str:
+    return f"[{','.join(str(v) for v in vec)}]"
+
+
+def _chunk_text(text: str) -> List[str]:
+    chunks: List[str] = []
+    size = settings.chunk_size
+    overlap = settings.chunk_overlap
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + size)
+        chunks.append(text[start:end])
+        if end >= len(text):
+            break
+        start = max(0, end - overlap)
+        if start >= end:
+            break
+    return chunks
+
+
+def _record_usage(
+    tenant_id: str, tokens_prompt: int, tokens_completion: int, meta: Optional[Dict]
+) -> Dict[str, float]:
+    cost = round((tokens_prompt + tokens_completion) * 0.000001, 6)
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO billing_usage (tenant_id, tokens_prompt, tokens_completion, cost, meta)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            [tenant_id, tokens_prompt, tokens_completion, cost, json.dumps(meta or {})],
+        )
+    return {"tokens_prompt": tokens_prompt, "tokens_completion": tokens_completion, "cost": cost}
+
+
+class IngestReq(BaseModel):
+    doc_id: str
+    tenant_id: Optional[str] = None
+
+
+@app.post("/ingest")
+def ingest(req: IngestReq):
+    doc = documents_collection.find_one({"_id": req.doc_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    tenant_id = req.tenant_id or doc.get("tenant_id") or settings.default_tenant
+    text = str(doc.get("storage", {}).get("mock_text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Document has no text to ingest")
+
+    chunks = _chunk_text(text)
+    embeddings: List[Tuple[str, str, int, str, str, str]] = []
+    for idx, chunk in enumerate(chunks):
+        embedding = _fake_embedding(chunk)
+        meta = {"source": "ocr", "tenant_id": tenant_id, "doc_id": req.doc_id}
+        embeddings.append(
+            (
+                tenant_id,
+                req.doc_id,
+                idx,
+                chunk,
+                _vector_literal(embedding),
+                json.dumps(meta),
+            )
+        )
+
+    with pg_conn.cursor() as cur:
+        cur.execute("DELETE FROM embeddings WHERE tenant_id = %s AND doc_id = %s", [tenant_id, req.doc_id])
+        cur.executemany(
+            """
+            INSERT INTO embeddings (tenant_id, doc_id, chunk_no, text, embedding, meta)
+            VALUES (%s, %s, %s, %s, %s::vector, %s)
+            """,
+            embeddings,
+        )
+
+    return {"doc_id": req.doc_id, "tenant_id": tenant_id, "chunks": len(chunks)}
+
+
+class SearchResponse(BaseModel):
+    doc_id: str
+    chunk_no: int
+    text: str
+    tenant_id: str
+    score: float
+    meta: Dict[str, object] = Field(default_factory=dict)
+
+
+def _lexical_score(text: str, tokens: List[str]) -> float:
+    chunk_tokens = set(_tokenize(text))
+    if not tokens:
+        return 0.0
+    return len(chunk_tokens & set(tokens)) / len(set(tokens))
+
+
+def hybrid_search(query: str, tenant_id: str, top_k: int = 8) -> List[SearchResponse]:
+    query_vec = _vector_literal(_fake_embedding(query))
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, tenant_id, doc_id, chunk_no, text, meta, 1 - (embedding <=> %s::vector) AS similarity
+            FROM embeddings
+            WHERE tenant_id = %s
+            ORDER BY embedding <-> %s::vector
+            LIMIT %s
+            """,
+            [query_vec, tenant_id, query_vec, top_k * 3],
+        )
+        rows = cur.fetchall()
+
+    tokens = _tokenize(query)
+    reranked: List[Tuple[float, Tuple]] = []
+    for row in rows:
+        row_dict = {
+            "id": row[0],
+            "tenant_id": row[1],
+            "doc_id": row[2],
+            "chunk_no": row[3],
+            "text": row[4],
+            "meta": row[5] if isinstance(row[5], dict) else json.loads(row[5] or "{}"),
+            "similarity": float(row[6] or 0.0),
+        }
+        rerank = 0.7 * row_dict["similarity"] + 0.3 * _lexical_score(row_dict["text"], tokens)
+        reranked.append((rerank, row_dict))
+
+    reranked.sort(key=lambda item: item[0], reverse=True)
+    top = reranked[:top_k]
+    return [
+        SearchResponse(
+            doc_id=row["doc_id"],
+            chunk_no=row["chunk_no"],
+            text=row["text"],
+            tenant_id=row["tenant_id"],
+            score=round(score, 4),
+            meta=row["meta"],
+        )
+        for score, row in top
+    ]
+
+
+@app.get("/search")
+def search(query: str, tenant_id: Optional[str] = None):
+    tenant = tenant_id or settings.default_tenant
+    results = hybrid_search(query, tenant)
+    return {"query": query, "tenant_id": tenant, "results": [r.dict() for r in results]}
+
+
 class ChatReq(BaseModel):
     message: str
-    tools_allowed: list[str] | None = None
+    tools_allowed: List[str] | None = None
+    tenant_id: Optional[str] = None
+
+
+def _maybe_call_tool(tools_allowed: Optional[List[str]], message: str) -> List[Dict[str, object]]:
+    if not tools_allowed:
+        return []
+    lowered = message.lower()
+    calls = []
+    if "corrigir" in lowered and "corrigir_campo" in tools_allowed:
+        calls.append({"name": "corrigir_campo", "result": "Campo corrigido com sucesso."})
+    if "recalcular" in lowered and "recalcular_limites" in tools_allowed:
+        calls.append({"name": "recalcular_limites", "result": "Limites recalculados."})
+    if "limite" in lowered and "mostrar_limites" in tools_allowed:
+        calls.append({"name": "mostrar_limites", "result": "Limites atuais exibidos."})
+    return calls
 
 
 @app.post("/chat")
 def chat(req: ChatReq):
-    # TODO: integrar RAG/LLM e contagem de tokens
-    usage = {"tokens_prompt": 10, "tokens_completion": 20, "cost": 0.001}
-    return {"reply": "(stub) resposta do agente", "usage": usage}
+    tenant = req.tenant_id or settings.default_tenant
+    contexts = hybrid_search(req.message, tenant)
+    tool_calls = _maybe_call_tool(req.tools_allowed, req.message)
+
+    context_snippets = " ".join(chunk.text for chunk in contexts[:3])
+    reply_parts = [f"Contexto: {context_snippets}" if context_snippets else "Sem contexto relevante."]
+    if tool_calls:
+        reply_parts.append("Ferramentas acionadas: " + ", ".join(call["name"] for call in tool_calls))
+    else:
+        reply_parts.append("Nenhuma ferramenta necessária.")
+    reply_parts.append(f"Resposta baseada na mensagem: {req.message}")
+    reply = " \n".join(reply_parts)
+
+    prompt_tokens = len(_tokenize(req.message)) + sum(len(_tokenize(c.text)) for c in contexts)
+    completion_tokens = len(_tokenize(reply))
+    usage = _record_usage(
+        tenant,
+        tokens_prompt=prompt_tokens,
+        tokens_completion=completion_tokens,
+        meta={"tool_calls": tool_calls, "contexts": jsonable_encoder(contexts)},
+    )
+
+    return {
+        "reply": reply,
+        "context": [c.dict() for c in contexts],
+        "tool_calls": tool_calls,
+        "usage": usage,
+    }
 
 
 @app.get("/orchestrator/health")
