@@ -1,0 +1,28 @@
+FROM python:3.11-slim AS fastapi-base
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && pip install --no-cache-dir \
+        fastapi \
+        "uvicorn[standard]" \
+        boto3 \
+        pymongo \
+        "psycopg[binary]" \
+        redis \
+        celery \
+        opentelemetry-sdk \
+        opentelemetry-exporter-otlp \
+        opentelemetry-instrumentation-fastapi \
+    && apt-get remove -y build-essential \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+
+FROM fastapi-base AS app
+ARG SERVICE_PATH
+WORKDIR /app
+COPY ${SERVICE_PATH}/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+COPY ${SERVICE_PATH}/ ./
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

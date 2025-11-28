@@ -1,4 +1,14 @@
 version: "3.9"
+
+x-fastapi-build: &fastapi-build
+  context: .
+  dockerfile: services/Dockerfile.fastapi
+
+x-fastapi-service: &fastapi-service
+  env_file: .env
+  networks:
+    - app
+
 services:
   postgres:
     image: postgres:16
@@ -6,70 +16,107 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_USER: postgres
       POSTGRES_DB: app
-    ports: ["5432:5432"]
+    ports:
+      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 3s
       retries: 10
-    networks: [app]
+    networks:
+      - app
 
   mongo:
     image: mongo:6
-    ports: ["27017:27017"]
-    networks: [app]
+    ports:
+      - "27017:27017"
+    networks:
+      - app
 
   redis:
     image: redis:7
-    ports: ["6379:6379"]
-    networks: [app]
+    ports:
+      - "6379:6379"
+    networks:
+      - app
 
   auth:
-    build: ./services/auth
-    env_file: .env
+    build:
+      <<: *fastapi-build
+      args:
+        SERVICE_PATH: services/auth
+    <<: *fastapi-service
     command: uvicorn main:app --host 0.0.0.0 --port 8081
-    ports: ["8081:8081"]
-    networks: [app]
+    ports:
+      - "8081:8081"
 
   documents:
-    build: ./services/documents
-    env_file: .env
-    depends_on: [mongo, redis]
+    build:
+      <<: *fastapi-build
+      args:
+        SERVICE_PATH: services/documents
+    <<: *fastapi-service
+    depends_on:
+      - mongo
+      - redis
     command: uvicorn main:app --host 0.0.0.0 --port 8083
-    ports: ["8083:8083"]
-    networks: [app]
+    ports:
+      - "8083:8083"
 
   limits:
-    build: ./services/limits
-    env_file: .env
-    depends_on: [postgres, redis]
+    build:
+      <<: *fastapi-build
+      args:
+        SERVICE_PATH: services/limits
+    <<: *fastapi-service
+    depends_on:
+      - postgres
+      - redis
     command: uvicorn main:app --host 0.0.0.0 --port 8087
-    ports: ["8087:8087"]
-    networks: [app]
+    ports:
+      - "8087:8087"
 
   orchestrator:
-    build: ./services/orchestrator
-    env_file: .env
-    depends_on: [postgres, mongo, redis]
+    build:
+      <<: *fastapi-build
+      args:
+        SERVICE_PATH: services/orchestrator
+    <<: *fastapi-service
+    depends_on:
+      - postgres
+      - mongo
+      - redis
     command: uvicorn main:app --host 0.0.0.0 --port 8085
-    ports: ["8085:8085"]
-    networks: [app]
+    ports:
+      - "8085:8085"
 
   billing:
-    build: ./services/billing
-    env_file: .env
-    depends_on: [postgres, redis]
+    build:
+      <<: *fastapi-build
+      args:
+        SERVICE_PATH: services/billing
+    <<: *fastapi-service
+    depends_on:
+      - postgres
+      - redis
     command: uvicorn main:app --host 0.0.0.0 --port 8086
-    ports: ["8086:8086"]
-    networks: [app]
+    ports:
+      - "8086:8086"
 
   api-gateway:
     image: nginx:1.27
     volumes:
       - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
-    ports: ["8080:8080"]
-    depends_on: [auth, documents, limits, orchestrator, billing]
-    networks: [app]
+    ports:
+      - "8080:8080"
+    depends_on:
+      - auth
+      - documents
+      - limits
+      - orchestrator
+      - billing
+    networks:
+      - app
 
 networks:
   app: {}

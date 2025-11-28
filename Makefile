@@ -1,11 +1,15 @@
-up:
-docker compose up -d --build
+DC ?= docker compose
 
-audit:
-docker compose ps
+.PHONY: up down test seed
+
+up:
+	$(DC) up -d --build
 
 down:
-docker compose down -v
+	$(DC) down -v
 
 test:
-@echo "(placeholder) execute seus testes aqui"
+	$(DC) run --rm orchestrator pytest
+
+seed:
+	$(DC) run --rm orchestrator bash -lc "echo 'seed data pipeline placeholder'"
