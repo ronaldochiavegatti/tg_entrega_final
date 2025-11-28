@@ -1,0 +1,75 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: app
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [app]
+
+  mongo:
+    image: mongo:6
+    ports: ["27017:27017"]
+    networks: [app]
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+    networks: [app]
+
+  auth:
+    build: ./services/auth
+    env_file: .env
+    command: uvicorn main:app --host 0.0.0.0 --port 8081
+    ports: ["8081:8081"]
+    networks: [app]
+
+  documents:
+    build: ./services/documents
+    env_file: .env
+    depends_on: [mongo, redis]
+    command: uvicorn main:app --host 0.0.0.0 --port 8083
+    ports: ["8083:8083"]
+    networks: [app]
+
+  limits:
+    build: ./services/limits
+    env_file: .env
+    depends_on: [postgres, redis]
+    command: uvicorn main:app --host 0.0.0.0 --port 8087
+    ports: ["8087:8087"]
+    networks: [app]
+
+  orchestrator:
+    build: ./services/orchestrator
+    env_file: .env
+    depends_on: [postgres, mongo, redis]
+    command: uvicorn main:app --host 0.0.0.0 --port 8085
+    ports: ["8085:8085"]
+    networks: [app]
+
+  billing:
+    build: ./services/billing
+    env_file: .env
+    depends_on: [postgres, redis]
+    command: uvicorn main:app --host 0.0.0.0 --port 8086
+    ports: ["8086:8086"]
+    networks: [app]
+
+  api-gateway:
+    image: nginx:1.27
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports: ["8080:8080"]
+    depends_on: [auth, documents, limits, orchestrator, billing]
+    networks: [app]
+
+networks:
+  app: {}
