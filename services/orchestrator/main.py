@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import re
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -14,7 +15,7 @@ from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, REGISTRY, generate_latest
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 from pymongo import MongoClient
@@ -37,33 +38,103 @@ class Settings(BaseSettings):
     embedding_dim: int = Field(default=64, alias="EMBEDDING_DIM")
     chunk_size: int = Field(default=800, alias="CHUNK_SIZE")
     chunk_overlap: int = Field(default=120, alias="CHUNK_OVERLAP")
+    dry_run: bool = Field(default=False, alias="DRY_RUN")
 
 
 settings = Settings()
-pg_conn = psycopg.connect(settings.postgres_dsn, autocommit=True)
-mongo_client = MongoClient(settings.mongo_uri)
-mongo_db = mongo_client[settings.mongo_db]
-documents_collection = mongo_db["documents"]
 
-REQUEST_LATENCY = Histogram(
-    "http_request_latency_seconds",
-    "HTTP request latency in seconds",
-    ["service", "method", "path"],
-)
-ERROR_COUNT = Counter(
-    "error_count",
-    "Total number of HTTP errors",
-    ["service", "method", "path", "status_code"],
-)
-BILLING_TOKENS = Counter(
-    "billing_tokens",
-    "Total billing tokens recorded",
-    ["tenant", "kind", "direction"],
-)
-BILLING_COST = Counter(
-    "billing_cost",
-    "Accumulated billing cost", ["tenant", "kind"]
-)
+
+class _DummyCursor:
+    def __init__(self):
+        self.queries: list[tuple] = []
+
+    def execute(self, *args, **kwargs):
+        self.queries.append((args, kwargs))
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+class _DummyConn:
+    def cursor(self):
+        return _DummyCursor()
+
+    def close(self):
+        return None
+
+
+class _DummyCollection(dict):
+    def find_one(self, _query):
+        return None
+
+    def find(self, _query):
+        return []
+
+
+if settings.dry_run:
+    pg_conn = _DummyConn()
+    mongo_client = None
+    mongo_db = None
+    documents_collection = _DummyCollection()
+else:
+    pg_conn = psycopg.connect(settings.postgres_dsn, autocommit=True)
+    mongo_client = MongoClient(settings.mongo_uri)
+    mongo_db = mongo_client[settings.mongo_db]
+    documents_collection = mongo_db["documents"]
+
+try:
+    REQUEST_LATENCY = Histogram(
+        "http_request_latency_seconds",
+        "HTTP request latency in seconds",
+        ["service", "method", "path"],
+    )
+    ERROR_COUNT = Counter(
+        "error_count",
+        "Total number of HTTP errors",
+        ["service", "method", "path", "status_code"],
+    )
+    BILLING_TOKENS = Counter(
+        "billing_tokens",
+        "Total billing tokens recorded",
+        ["tenant", "kind", "direction"],
+    )
+    BILLING_COST = Counter(
+        "billing_cost",
+        "Accumulated billing cost", ["tenant", "kind"]
+    )
+except ValueError:
+    collectors = getattr(REGISTRY, "_names_to_collectors", {})
+    REQUEST_LATENCY = collectors.get("http_request_latency_seconds") or Histogram(
+        "http_request_latency_seconds",
+        "HTTP request latency in seconds",
+        ["service", "method", "path"],
+        registry=None,
+    )
+    ERROR_COUNT = collectors.get("error_count") or Counter(
+        "error_count",
+        "Total number of HTTP errors",
+        ["service", "method", "path", "status_code"],
+        registry=None,
+    )
+    BILLING_TOKENS = collectors.get("billing_tokens") or Counter(
+        "billing_tokens",
+        "Total billing tokens recorded",
+        ["tenant", "kind", "direction"],
+        registry=None,
+    )
+    BILLING_COST = collectors.get("billing_cost") or Counter(
+        "billing_cost",
+        "Accumulated billing cost", ["tenant", "kind"], registry=None
+    )
 
 
 def _setup_tracer(service_name: str) -> None:
@@ -114,6 +185,8 @@ _configure_observability(app, "orchestrator")
 
 
 def _ensure_tables() -> None:
+    if settings.dry_run:
+        return
     with pg_conn.cursor() as cur:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
         cur.execute(
@@ -182,12 +255,15 @@ def on_startup() -> None:
 
 @app.on_event("shutdown")
 def on_shutdown() -> None:
-    mongo_client.close()
-    pg_conn.close()
+    if mongo_client:
+        mongo_client.close()
+    if pg_conn:
+        pg_conn.close()
 
 
 def _tokenize(text: str) -> List[str]:
-    return [tok.lower() for tok in text.split() if tok.strip()]
+    normalized = re.sub(r"[^\w]+", " ", text)
+    return [tok.lower() for tok in normalized.split() if tok.strip()]
 
 
 def _fake_embedding(text: str) -> List[float]:
@@ -219,7 +295,25 @@ def _chunk_text(text: str) -> List[str]:
     return chunks
 
 
+def _dry_run_contexts(query: str, tenant_id: str) -> List["SearchResponse"]:
+    base_text = query or "Contexto simulado para dry-run"
+    chunks = _chunk_text(base_text) or [base_text]
+    return [
+        SearchResponse(
+            doc_id=f"dry-run-{idx}",
+            chunk_no=idx,
+            text=chunk,
+            tenant_id=tenant_id,
+            score=1.0,
+            meta={"dry_run": True},
+        )
+        for idx, chunk in enumerate(chunks[:3])
+    ]
+
+
 def _get_unit_price(kind: str) -> float:
+    if settings.dry_run:
+        return 0.0
     with pg_conn.cursor() as cur:
         cur.execute("SELECT unit_price FROM billing_tariffs WHERE kind = %s", [kind])
         row = cur.fetchone()
@@ -234,6 +328,15 @@ def _record_usage(
     BILLING_TOKENS.labels(tenant_id, kind, "prompt").inc(tokens_prompt)
     BILLING_TOKENS.labels(tenant_id, kind, "completion").inc(tokens_completion)
     BILLING_COST.labels(tenant_id, kind).inc(cost)
+    if settings.dry_run:
+        return {
+            "tokens_prompt": tokens_prompt,
+            "tokens_completion": tokens_completion,
+            "unit_price": unit_price,
+            "cost": cost,
+            "dry_run": True,
+        }
+
     with pg_conn.cursor() as cur:
         cur.execute(
             """
@@ -258,6 +361,16 @@ class IngestReq(BaseModel):
 
 @app.post("/ingest", dependencies=[Depends(require_roles(["editor", "admin"]))])
 def ingest(req: IngestReq):
+    if settings.dry_run:
+        tenant = req.tenant_id or settings.default_tenant
+        chunks = _chunk_text(f"Ingestao simulada para {req.doc_id}") or [req.doc_id]
+        return {
+            "doc_id": req.doc_id,
+            "tenant_id": tenant,
+            "chunks": len(chunks),
+            "dry_run": True,
+        }
+
     doc = documents_collection.find_one({"_id": req.doc_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -312,6 +425,8 @@ def _lexical_score(text: str, tokens: List[str]) -> float:
 
 
 def hybrid_search(query: str, tenant_id: str, top_k: int = 8) -> List[SearchResponse]:
+    if settings.dry_run:
+        return _dry_run_contexts(query, tenant_id)
     query_vec = _vector_literal(_fake_embedding(query))
     with pg_conn.cursor() as cur:
         cur.execute(
@@ -360,7 +475,10 @@ def hybrid_search(query: str, tenant_id: str, top_k: int = 8) -> List[SearchResp
 def search(query: str, tenant_id: Optional[str] = None):
     tenant = tenant_id or settings.default_tenant
     results = hybrid_search(query, tenant)
-    return {"query": query, "tenant_id": tenant, "results": [r.dict() for r in results]}
+    payload = {"query": query, "tenant_id": tenant, "results": [r.dict() for r in results]}
+    if settings.dry_run:
+        payload["dry_run"] = True
+    return payload
 
 
 class ChatReq(BaseModel):
@@ -396,6 +514,8 @@ def chat(req: ChatReq):
     else:
         reply_parts.append("Nenhuma ferramenta necessária.")
     reply_parts.append(f"Resposta baseada na mensagem: {req.message}")
+    if settings.dry_run:
+        reply_parts.append("Modo DRY_RUN: tokens e chamadas simulados.")
     reply = " \n".join(reply_parts)
 
     prompt_tokens = len(_tokenize(req.message)) + sum(len(_tokenize(c.text)) for c in contexts)
@@ -408,12 +528,17 @@ def chat(req: ChatReq):
         kind="rag",
     )
 
-    return {
+    response = {
         "reply": reply,
         "context": [c.dict() for c in contexts],
         "tool_calls": tool_calls,
         "usage": usage,
     }
+
+    if settings.dry_run:
+        response["dry_run"] = True
+
+    return response
 
 
 @app.get("/orchestrator/health")

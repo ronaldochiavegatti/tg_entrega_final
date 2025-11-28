@@ -15,7 +15,7 @@ from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, REGISTRY, generate_latest
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 import psycopg
@@ -47,16 +47,31 @@ documents_collection = mongo_db["documents"]
 
 pg_conn = psycopg.connect(POSTGRES_DSN, autocommit=True)
 
-REQUEST_LATENCY = Histogram(
-    "http_request_latency_seconds",
-    "HTTP request latency in seconds",
-    ["service", "method", "path"],
-)
-ERROR_COUNT = Counter(
-    "error_count",
-    "Total number of HTTP errors",
-    ["service", "method", "path", "status_code"],
-)
+try:
+    REQUEST_LATENCY = Histogram(
+        "http_request_latency_seconds",
+        "HTTP request latency in seconds",
+        ["service", "method", "path"],
+    )
+    ERROR_COUNT = Counter(
+        "error_count",
+        "Total number of HTTP errors",
+        ["service", "method", "path", "status_code"],
+    )
+except ValueError:
+    collectors = getattr(REGISTRY, "_names_to_collectors", {})
+    REQUEST_LATENCY = collectors.get("http_request_latency_seconds") or Histogram(
+        "http_request_latency_seconds",
+        "HTTP request latency in seconds",
+        ["service", "method", "path"],
+        registry=None,
+    )
+    ERROR_COUNT = collectors.get("error_count") or Counter(
+        "error_count",
+        "Total number of HTTP errors",
+        ["service", "method", "path", "status_code"],
+        registry=None,
+    )
 
 
 def _setup_tracer(service_name: str) -> None:

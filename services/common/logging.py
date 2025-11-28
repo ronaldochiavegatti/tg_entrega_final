@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from typing import Any, Dict
@@ -96,4 +97,5 @@ def configure_structured_logging(service_name: str, level: int = logging.INFO) -
     root_logger.handlers.clear()
     root_logger.setLevel(level)
     root_logger.addHandler(handler)
-    logging.captureWarnings(True)
+    capture = os.getenv("CAPTURE_LOG_WARNINGS", "1").lower()
+    logging.captureWarnings(capture not in {"0", "false"})

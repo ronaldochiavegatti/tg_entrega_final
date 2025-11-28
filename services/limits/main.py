@@ -15,7 +15,7 @@ from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, REGISTRY, generate_latest
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 
@@ -35,26 +35,53 @@ mongo_client = MongoClient(MONGO_URI)
 mongo_db = mongo_client[MONGO_DB]
 documents_collection = mongo_db["documents"]
 
-REQUEST_LATENCY = Histogram(
-    "http_request_latency_seconds",
-    "HTTP request latency in seconds",
-    ["service", "method", "path"],
-)
-ERROR_COUNT = Counter(
-    "error_count",
-    "Total number of HTTP errors",
-    ["service", "method", "path", "status_code"],
-)
-LIMITS_RECALC = Histogram(
-    "limits_recalc_latency_ms",
-    "Latency for recalculating limits in milliseconds",
-    ["tenant", "year"],
-)
-LIMITS_STATE = Counter(
-    "limits_state_count",
-    "Count of calculated limit states",
-    ["tenant", "year", "state"],
-)
+try:
+    REQUEST_LATENCY = Histogram(
+        "http_request_latency_seconds",
+        "HTTP request latency in seconds",
+        ["service", "method", "path"],
+    )
+    ERROR_COUNT = Counter(
+        "error_count",
+        "Total number of HTTP errors",
+        ["service", "method", "path", "status_code"],
+    )
+    LIMITS_RECALC = Histogram(
+        "limits_recalc_latency_ms",
+        "Latency for recalculating limits in milliseconds",
+        ["tenant", "year"],
+    )
+    LIMITS_STATE = Counter(
+        "limits_state_count",
+        "Count of calculated limit states",
+        ["tenant", "year", "state"],
+    )
+except ValueError:
+    collectors = getattr(REGISTRY, "_names_to_collectors", {})
+    REQUEST_LATENCY = collectors.get("http_request_latency_seconds") or Histogram(
+        "http_request_latency_seconds",
+        "HTTP request latency in seconds",
+        ["service", "method", "path"],
+        registry=None,
+    )
+    ERROR_COUNT = collectors.get("error_count") or Counter(
+        "error_count",
+        "Total number of HTTP errors",
+        ["service", "method", "path", "status_code"],
+        registry=None,
+    )
+    LIMITS_RECALC = collectors.get("limits_recalc_latency_ms") or Histogram(
+        "limits_recalc_latency_ms",
+        "Latency for recalculating limits in milliseconds",
+        ["tenant", "year"],
+        registry=None,
+    )
+    LIMITS_STATE = collectors.get("limits_state_count") or Counter(
+        "limits_state_count",
+        "Count of calculated limit states",
+        ["tenant", "year", "state"],
+        registry=None,
+    )
 
 
 def _setup_tracer(service_name: str) -> None:

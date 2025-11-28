@@ -12,4 +12,4 @@ test:
 	$(DC) run --rm orchestrator pytest
 
 seed:
-	$(DC) run --rm orchestrator bash -lc "echo 'seed data pipeline placeholder'"
+$(DC) run --rm orchestrator bash -lc "PYTHONPATH=services python infra/synthetic_data.py --count 50"
