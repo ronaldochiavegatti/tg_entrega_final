@@ -1,0 +1,39 @@
+{
+  "title": "RAG Latency & Throughput",
+  "schemaVersion": 38,
+  "version": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Chat/Search Latency (P95)",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_latency_seconds_bucket{service=\"orchestrator\",path=\"/chat\"}[5m])) by (le))",
+          "legendFormat": "chat P95"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_latency_seconds_bucket{service=\"orchestrator\",path=\"/search\"}[5m])) by (le))",
+          "legendFormat": "search P95"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0}
+    },
+    {
+      "type": "timeseries",
+      "title": "Chat/Search Throughput",
+      "targets": [
+        {
+          "expr": "sum(rate(http_request_latency_seconds_count{service=\"orchestrator\",path=\"/chat\"}[5m]))",
+          "legendFormat": "chat rps"
+        },
+        {
+          "expr": "sum(rate(http_request_latency_seconds_count{service=\"orchestrator\",path=\"/search\"}[5m]))",
+          "legendFormat": "search rps"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+    }
+  ]
+}

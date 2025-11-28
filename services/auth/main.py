@@ -5,9 +5,17 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from opentelemetry import baggage, context, trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel
 from pydantic_settings import BaseSettings
 
@@ -41,7 +49,63 @@ if not USER_STORE_PATH.exists():
 USERS: List[Dict[str, str]] = json.loads(USER_STORE_PATH.read_text()).get("users", [])
 USERS_BY_EMAIL = {user["email"]: user for user in USERS}
 
+REQUEST_LATENCY = Histogram(
+    "http_request_latency_seconds",
+    "HTTP request latency in seconds",
+    ["service", "method", "path"],
+)
+ERROR_COUNT = Counter(
+    "error_count",
+    "Total number of HTTP errors",
+    ["service", "method", "path", "status_code"],
+)
+
+
+def _setup_tracer(service_name: str) -> None:
+    resource = Resource.create({"service.name": service_name})
+    tracer_provider = TracerProvider(resource=resource)
+    tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(tracer_provider)
+    RequestsInstrumentor().instrument()
+
+
+def _configure_observability(app: FastAPI, service_name: str) -> None:
+    _setup_tracer(service_name)
+    FastAPIInstrumentor.instrument_app(app)
+
+    @app.middleware("http")
+    async def _metrics_and_baggage(request: Request, call_next):
+        start = time.perf_counter()
+        ctx = context.get_current()
+        tenant_id = request.headers.get("x-tenant-id")
+        user_id = request.headers.get("x-user-id")
+        if tenant_id:
+            ctx = baggage.set_baggage("tenant_id", tenant_id, context=ctx)
+        if user_id:
+            ctx = baggage.set_baggage("user_id", user_id, context=ctx)
+        token = context.attach(ctx)
+        try:
+            response = await call_next(request)
+        except Exception:
+            ERROR_COUNT.labels(service_name, request.method, request.url.path, "500").inc()
+            raise
+        finally:
+            elapsed = time.perf_counter() - start
+            REQUEST_LATENCY.labels(service_name, request.method, request.url.path).observe(elapsed)
+            context.detach(token)
+        if response.status_code >= 400:
+            ERROR_COUNT.labels(
+                service_name, request.method, request.url.path, str(response.status_code)
+            ).inc()
+        return response
+
+    @app.get("/metrics")
+    def _metrics() -> Response:
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 app = FastAPI(title="auth")
+_configure_observability(app, "auth")
 security = HTTPBearer(auto_error=False)
 
 

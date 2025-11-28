@@ -1,11 +1,20 @@
 import hashlib
 import json
 import logging
+import time
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import psycopg
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.encoders import jsonable_encoder
+from opentelemetry import baggage, context, trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 from pymongo import MongoClient
@@ -32,7 +41,72 @@ mongo_client = MongoClient(settings.mongo_uri)
 mongo_db = mongo_client[settings.mongo_db]
 documents_collection = mongo_db["documents"]
 
+REQUEST_LATENCY = Histogram(
+    "http_request_latency_seconds",
+    "HTTP request latency in seconds",
+    ["service", "method", "path"],
+)
+ERROR_COUNT = Counter(
+    "error_count",
+    "Total number of HTTP errors",
+    ["service", "method", "path", "status_code"],
+)
+BILLING_TOKENS = Counter(
+    "billing_tokens",
+    "Total billing tokens recorded",
+    ["tenant", "kind", "direction"],
+)
+BILLING_COST = Counter(
+    "billing_cost",
+    "Accumulated billing cost", ["tenant", "kind"]
+)
+
+
+def _setup_tracer(service_name: str) -> None:
+    resource = Resource.create({"service.name": service_name})
+    tracer_provider = TracerProvider(resource=resource)
+    tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(tracer_provider)
+    RequestsInstrumentor().instrument()
+
+
+def _configure_observability(app: FastAPI, service_name: str) -> None:
+    _setup_tracer(service_name)
+    FastAPIInstrumentor.instrument_app(app)
+
+    @app.middleware("http")
+    async def _metrics_and_baggage(request: Request, call_next):
+        start = time.perf_counter()
+        ctx = context.get_current()
+        tenant_id = request.headers.get("x-tenant-id")
+        user_id = request.headers.get("x-user-id")
+        if tenant_id:
+            ctx = baggage.set_baggage("tenant_id", tenant_id, context=ctx)
+        if user_id:
+            ctx = baggage.set_baggage("user_id", user_id, context=ctx)
+        token = context.attach(ctx)
+        try:
+            response = await call_next(request)
+        except Exception:
+            ERROR_COUNT.labels(service_name, request.method, request.url.path, "500").inc()
+            raise
+        finally:
+            elapsed = time.perf_counter() - start
+            REQUEST_LATENCY.labels(service_name, request.method, request.url.path).observe(elapsed)
+            context.detach(token)
+        if response.status_code >= 400:
+            ERROR_COUNT.labels(
+                service_name, request.method, request.url.path, str(response.status_code)
+            ).inc()
+        return response
+
+    @app.get("/metrics")
+    def _metrics() -> Response:
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 app = FastAPI(title="orchestrator")
+_configure_observability(app, "orchestrator")
 
 
 def _ensure_tables() -> None:
@@ -153,6 +227,9 @@ def _record_usage(
 ) -> Dict[str, float]:
     unit_price = _get_unit_price(kind)
     cost = round((tokens_prompt + tokens_completion) * unit_price, 6)
+    BILLING_TOKENS.labels(tenant_id, kind, "prompt").inc(tokens_prompt)
+    BILLING_TOKENS.labels(tenant_id, kind, "completion").inc(tokens_completion)
+    BILLING_COST.labels(tenant_id, kind).inc(cost)
     with pg_conn.cursor() as cur:
         cur.execute(
             """

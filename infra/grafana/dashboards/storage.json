@@ -1,0 +1,34 @@
+{
+  "title": "Storage I/O",
+  "schemaVersion": 38,
+  "version": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Storage I/O Latency",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(storage_io_latency_ms_bucket[5m])) by (le, operation, tenant))",
+          "legendFormat": "P95 {{operation}} {{tenant}}"
+        },
+        {
+          "expr": "rate(storage_io_latency_ms_sum[5m]) / rate(storage_io_latency_ms_count[5m])",
+          "legendFormat": "avg latency"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ms"}, "overrides": []},
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 0}
+    },
+    {
+      "type": "stat",
+      "title": "Storage Errors",
+      "targets": [
+        {
+          "expr": "sum(rate(storage_errors_total[5m])) by (operation, tenant)",
+          "legendFormat": "{{operation}} {{tenant}}"
+        }
+      ],
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 10}
+    }
+  ]
+}

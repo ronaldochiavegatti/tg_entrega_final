@@ -1,12 +1,21 @@
 import datetime as dt
 import logging
 import os
+import time
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional
 
 from celery import Celery
-from fastapi import Body, FastAPI, HTTPException, status
+from fastapi import Body, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
+from opentelemetry import baggage, context, trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 
@@ -23,7 +32,73 @@ mongo_client = MongoClient(MONGO_URI)
 mongo_db = mongo_client[MONGO_DB]
 documents_collection = mongo_db["documents"]
 
+REQUEST_LATENCY = Histogram(
+    "http_request_latency_seconds",
+    "HTTP request latency in seconds",
+    ["service", "method", "path"],
+)
+ERROR_COUNT = Counter(
+    "error_count",
+    "Total number of HTTP errors",
+    ["service", "method", "path", "status_code"],
+)
+LIMITS_RECALC = Histogram(
+    "limits_recalc_latency_ms",
+    "Latency for recalculating limits in milliseconds",
+    ["tenant", "year"],
+)
+LIMITS_STATE = Counter(
+    "limits_state_count",
+    "Count of calculated limit states",
+    ["tenant", "year", "state"],
+)
+
+
+def _setup_tracer(service_name: str) -> None:
+    resource = Resource.create({"service.name": service_name})
+    tracer_provider = TracerProvider(resource=resource)
+    tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(tracer_provider)
+    RequestsInstrumentor().instrument()
+
+
+def _configure_observability(app: FastAPI, service_name: str) -> None:
+    _setup_tracer(service_name)
+    FastAPIInstrumentor.instrument_app(app)
+
+    @app.middleware("http")
+    async def _metrics_and_baggage(request: Request, call_next):
+        start = time.perf_counter()
+        ctx = context.get_current()
+        tenant_id = request.headers.get("x-tenant-id")
+        user_id = request.headers.get("x-user-id")
+        if tenant_id:
+            ctx = baggage.set_baggage("tenant_id", tenant_id, context=ctx)
+        if user_id:
+            ctx = baggage.set_baggage("user_id", user_id, context=ctx)
+        token = context.attach(ctx)
+        try:
+            response = await call_next(request)
+        except Exception:
+            ERROR_COUNT.labels(service_name, request.method, request.url.path, "500").inc()
+            raise
+        finally:
+            elapsed = time.perf_counter() - start
+            REQUEST_LATENCY.labels(service_name, request.method, request.url.path).observe(elapsed)
+            context.detach(token)
+        if response.status_code >= 400:
+            ERROR_COUNT.labels(
+                service_name, request.method, request.url.path, str(response.status_code)
+            ).inc()
+        return response
+
+    @app.get("/metrics")
+    def _metrics() -> Response:
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 app = FastAPI(title="limits")
+_configure_observability(app, "limits")
 
 EVENT_FIELDS_UPDATED = "FIELDS_UPDATED"
 EVENT_LIMITS_RECALCULATED = "LIMITS_RECALCULATED"
@@ -243,6 +318,7 @@ def _build_dashboard_payload(
 
 
 def recalc_limits(tenant_id: str, year: int, doc_ids: Optional[list[str]] = None) -> DashboardResponse:
+    start = time.perf_counter()
     docs = _collect_documents(tenant_id, year, doc_ids)
     summaries = _summaries_from_documents(docs)
     config = _get_limit_config(year)
@@ -258,6 +334,9 @@ def recalc_limits(tenant_id: str, year: int, doc_ids: Optional[list[str]] = None
         EVENT_LIMITS_RECALCULATED,
         {"tenant_id": tenant_id, "year": year, "state": dashboard.state, "accumulated": dashboard.accumulated},
     )
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    LIMITS_RECALC.labels(str(tenant_id), str(year)).observe(elapsed_ms)
+    LIMITS_STATE.labels(str(tenant_id), str(year), dashboard.state).inc()
     return dashboard
 
 

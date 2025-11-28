@@ -1,0 +1,35 @@
+{
+  "title": "Billing Tokens & Cost",
+  "schemaVersion": 38,
+  "version": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Tokens por Kind",
+      "targets": [
+        {
+          "expr": "sum(rate(billing_tokens_total{direction=\"prompt\"}[5m])) by (tenant, kind)",
+          "legendFormat": "prompt {{kind}} {{tenant}}"
+        },
+        {
+          "expr": "sum(rate(billing_tokens_total{direction=\"completion\"}[5m])) by (tenant, kind)",
+          "legendFormat": "completion {{kind}} {{tenant}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "tokens"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0}
+    },
+    {
+      "type": "timeseries",
+      "title": "Custo acumulado",
+      "targets": [
+        {
+          "expr": "sum(rate(billing_cost_total[5m])) by (tenant, kind)",
+          "legendFormat": "{{tenant}} {{kind}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8}
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "title": "Limits Recalc Latency",
+  "schemaVersion": 38,
+  "version": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Recalc Latency P95/P99",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(limits_recalc_latency_ms_bucket[5m])) by (le, tenant, year))",
+          "legendFormat": "P95 {{tenant}}/{{year}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(limits_recalc_latency_ms_bucket[5m])) by (le, tenant, year))",
+          "legendFormat": "P99 {{tenant}}/{{year}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "ms"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 0}
+    },
+    {
+      "type": "bargauge",
+      "title": "State Counts",
+      "targets": [
+        {
+          "expr": "sum(rate(limits_state_count_total[5m])) by (state, tenant, year)",
+          "legendFormat": "{{state}} {{tenant}}/{{year}}"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "options": {"displayMode": "gradient", "orientation": "horizontal"},
+      "gridPos": {"h": 7, "w": 24, "x": 0, "y": 9}
+    }
+  ]
+}
