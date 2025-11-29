@@ -10,7 +10,7 @@ on:
 env:
   PYTHON_VERSION: "3.11"
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ toLower(github.repository) }}
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   lint:
