@@ -3,17 +3,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
+    && pip install --no-cache-dir --upgrade pip==25.3 \
     && pip install --no-cache-dir \
-        fastapi \
-        "uvicorn[standard]" \
-        boto3 \
-        pymongo \
-        "psycopg[binary]" \
-        redis \
-        celery \
-        opentelemetry-sdk \
-        opentelemetry-exporter-otlp \
-        opentelemetry-instrumentation-fastapi \
+        fastapi==0.115.6 \
+        starlette==0.40.0 \
+        "uvicorn[standard]"==0.30.6 \
+        boto3==1.34.162 \
+        pymongo==4.8.0 \
+        "psycopg[binary]"==3.2.1 \
+        redis==5.0.8 \
+        celery==5.4.0 \
+        python-multipart==0.0.20 \
+        opentelemetry-sdk==1.27.0 \
+        opentelemetry-exporter-otlp==1.27.0 \
+        opentelemetry-instrumentation-fastapi==0.48b0 \
+        opentelemetry-instrumentation-requests==0.48b0 \
     && apt-get remove -y build-essential \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
